@@ -22,6 +22,17 @@ async fn new_source_form_returns_200() {
     assert_eq!(response.status(), 200);
 }
 
+/// Whether `body` has an element whose text is `text`, ignoring the
+/// whitespace templates leave around it (`<button ...>\n  Save\n</button>`).
+fn contains_element_text(body: &str, text: &str) -> bool {
+    body.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace("> ", ">")
+        .replace(" <", "<")
+        .contains(&format!(">{text}<"))
+}
+
 /// Helper for the source-edit tests: insert a caldav source for the test user.
 /// Returns the source id. Encrypts with the all-zeroes test secret_key so
 /// the update handler's decrypt-on-keep-existing path works. The edit
@@ -898,7 +909,7 @@ async fn saving_the_picker_stores_the_setting_for_new_calendars() {
     )
     .await;
     assert!(body.contains(r#"name="sync_new" value="on" >"#));
-    assert!(body.contains(">Save<"));
+    assert!(contains_element_text(&body, "Save"));
 }
 
 /// A source with no calendar yet still offers the setting for calendars
@@ -919,7 +930,7 @@ async fn the_picker_of_a_source_without_calendars_offers_the_setting() {
     .await;
     assert!(body.contains("No calendars found for this source yet"));
     assert!(body.contains(r#"name="sync_new" value="on" checked"#));
-    assert!(body.contains(">Save<"));
+    assert!(contains_element_text(&body, "Save"));
 }
 
 /// A source whose calendars are all off (a picker left without saving)
