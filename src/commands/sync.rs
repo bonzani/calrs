@@ -3131,7 +3131,10 @@ mod tests {
             .bind(&account_id).bind(&user_id).execute(pool).await.unwrap();
         sqlx::query("INSERT INTO event_types (id, account_id, slug, title, duration_min) VALUES (?, ?, 'intro', 'Intro', 30)")
             .bind(&et_id).bind(&account_id).execute(pool).await.unwrap();
-        sqlx::query("INSERT INTO caldav_sources (id, account_id, name, url, username, write_calendar_href) VALUES (?, ?, 'test', 'https://dav.example.com/', 'user', '/calendars/host/default/')")
+        // A source its owner has set up with calendars found later synced,
+        // which is how every source behaved before the selection. Tests of
+        // a new source turn `sync_new_calendars` off themselves.
+        sqlx::query("INSERT INTO caldav_sources (id, account_id, name, url, username, write_calendar_href, sync_new_calendars) VALUES (?, ?, 'test', 'https://dav.example.com/', 'user', '/calendars/host/default/', 1)")
             .bind(&source_id).bind(&account_id).execute(pool).await.unwrap();
 
         (source_id, et_id)
@@ -4083,7 +4086,8 @@ END:VCALENDAR
             .execute(pool).await.unwrap();
         sqlx::query("INSERT INTO event_types (id, account_id, slug, title, duration_min) VALUES (?, ?, 'intro', 'Intro', 30)")
             .bind(&event_type).bind(&account).execute(pool).await.unwrap();
-        sqlx::query("INSERT INTO caldav_sources (id, account_id, name, url, username, write_calendar_href, provider_type) VALUES (?, ?, 'Provider', 'https://example.com/', 'host', 'write', ?)")
+        // Set up, with calendars found later synced (see `seed_fixtures`).
+        sqlx::query("INSERT INTO caldav_sources (id, account_id, name, url, username, write_calendar_href, provider_type, sync_new_calendars) VALUES (?, ?, 'Provider', 'https://example.com/', 'host', 'write', ?, 1)")
             .bind(&source).bind(&account).bind(kind).execute(pool).await.unwrap();
         let (calendar, _, _, _) =
             upsert_calendar_provider(pool, &source, &snapshot_provider("write").calendar)
@@ -6221,12 +6225,16 @@ END:VCALENDAR
         );
     }
 
-    /// The first sync of a new source lists its calendars, all unsynced,
-    /// without a single REPORT, then syncs only what its owner turns on.
+    /// The first sync of a new source (calendars found later not synced,
+    /// the default) lists its calendars, all unsynced, without a single
+    /// REPORT, then syncs only what its owner turns on.
     #[tokio::test]
     async fn a_new_source_lists_its_calendars_without_fetching_any() {
         let pool = setup_test_db().await;
         let (source_id, _) = seed_fixtures(&pool).await;
+        set_sync_new_calendars(&pool, &source_id, false)
+            .await
+            .unwrap();
         let key = [0u8; 32];
         let (base, requests) = spawn_two_calendar_dav().await;
         let client = CaldavClient::new(&base, "user", "pw");
@@ -6316,6 +6324,9 @@ END:VCALENDAR
     async fn a_calendar_found_by_a_sync_is_listed_but_not_fetched() {
         let pool = setup_test_db().await;
         let (source_id, _) = seed_fixtures(&pool).await;
+        set_sync_new_calendars(&pool, &source_id, false)
+            .await
+            .unwrap();
         let key = [0u8; 32];
         let (base, requests) = spawn_two_calendar_dav().await;
         let client = CaldavClient::new(&base, "user", "pw");
@@ -6421,7 +6432,8 @@ END:VCALENDAR
         let (base, requests) = spawn_two_calendar_dav().await;
         let client = CaldavClient::new(&base, "user", "pw");
 
-        // First sync: both calendars are discovered, synced by default.
+        // First sync: both calendars are discovered, synced as the source
+        // syncs calendars found later.
         sync_source(&pool, &key, &client, &source_id).await.unwrap();
         assert!(requests
             .lock()
@@ -6753,6 +6765,9 @@ END:VCALENDAR
     async fn provider_sync_never_fetches_a_new_calendar() {
         let pool = setup_test_db().await;
         let (source_id, _) = seed_fixtures(&pool).await;
+        set_sync_new_calendars(&pool, &source_id, false)
+            .await
+            .unwrap();
         let key = [0u8; 32];
         let provider = TwoFolderProvider(Default::default());
 
@@ -6838,6 +6853,9 @@ END:VCALENDAR
     async fn ews_sync_never_fetches_a_new_folder() {
         let pool = setup_test_db().await;
         let (source_id, _) = seed_fixtures(&pool).await;
+        set_sync_new_calendars(&pool, &source_id, false)
+            .await
+            .unwrap();
         let key = [0u8; 32];
         sqlx::query("INSERT INTO calendars (id, source_id, href, display_name, sync_enabled) VALUES (?, ?, 'mine', 'mine', 1)")
             .bind(Uuid::new_v4().to_string())

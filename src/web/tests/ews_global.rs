@@ -153,6 +153,8 @@ async fn a_managed_source_cannot_be_edited_or_removed_by_its_user() {
     let (app, pool, admin_session, user_id, user_session) = setup_with_global(false, false).await;
     let sid = provision(&pool, &user_id, "alice@example.com").await;
 
+    // Its edit link leads to its calendars page, the one thing its user
+    // chooses; the connection itself cannot be changed.
     let edit = app
         .clone()
         .oneshot(get_authed(
@@ -161,7 +163,23 @@ async fn a_managed_source_cannot_be_edited_or_removed_by_its_user() {
         ))
         .await
         .unwrap();
-    assert_eq!(edit.status(), 403);
+    assert_eq!(edit.status(), 303);
+    assert_eq!(
+        edit.headers()["location"],
+        format!("/dashboard/sources/{sid}/calendars")
+    );
+    let csrf = "csrf-managed-edit";
+    let update = app
+        .clone()
+        .oneshot(post_form(
+            &format!("/dashboard/sources/{sid}/edit"),
+            &user_session,
+            csrf,
+            &format!("_csrf={csrf}&name=Mine&url=https%3A%2F%2F192.0.2.10%2F&username=u&password="),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(update.status(), 403);
 
     let csrf = "csrf-managed";
     let removed = app
