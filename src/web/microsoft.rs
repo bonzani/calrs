@@ -176,9 +176,10 @@ pub(super) async fn microsoft_callback(
         )
             .into_response();
     }
-    // Only the calendars are listed here, for the write-calendar choice. The
-    // events come from a background sync: a large mailbox can take longer
-    // than a reverse proxy waits for this response, and the state is spent.
+    // Only the calendars are listed here, all unsynced until their owner
+    // picks them. The events come from a background sync: a large mailbox
+    // can take longer than a reverse proxy waits for this response, and the
+    // state is spent.
     // Do not imply successful discovery when Graph rejects calendar access.
     let provider = match crate::microsoft_oauth::build_provider_for_source(
         &state.pool,
@@ -231,7 +232,24 @@ pub(super) async fn microsoft_callback(
             );
         }
     };
-    let destination = if selected.as_ref().is_some_and(|href| !href.is_empty()) {
+    // No calendar is synced before its owner turns it on: with none on
+    // yet (a new connection), the owner picks them first, and saving runs
+    // the sync that fetches them, then the write calendar setup.
+    let synced: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM calendars WHERE source_id = ? AND sync_enabled = 1",
+    )
+    .bind(&source_id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(0);
+    let listed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM calendars WHERE source_id = ?")
+        .bind(&source_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(0);
+    let destination = if synced == 0 && listed > 0 {
+        format!("/dashboard/sources/{source_id}/calendars?setup=1")
+    } else if selected.as_ref().is_some_and(|href| !href.is_empty()) {
         "/dashboard/sources".to_string()
     } else {
         format!("/dashboard/sources/{source_id}/setup-write")

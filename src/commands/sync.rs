@@ -242,9 +242,21 @@ pub async fn sync_source(
     result
 }
 
-// List a CalDAV source's calendars into the cache without fetching any
-/// event. Calendars already known keep their setting; new ones follow the
-/// source's `sync_new_calendars`. Returns the number of calendars listed.
+/// What [`upsert_calendar`] does with a calendar it has not seen before.
+#[derive(Clone, Copy)]
+enum NewCalendar {
+    /// What the source says ([`new_calendars_sync`]): a sync.
+    SourceSetting,
+    /// Unsynced whatever the source says: a listing for review.
+    Unsynced,
+}
+
+/// List a CalDAV source's calendars into the cache without fetching any
+/// event, for its owner to review. Calendars already known keep their
+/// setting; a new one starts unsynced even when the source syncs calendars
+/// found later, since the listing may be of an account just connected (a
+/// source pointed elsewhere on its edit page). Returns the number of
+/// calendars listed.
 pub async fn discover_caldav_calendars(
     pool: &SqlitePool,
     client: &CaldavClient,
@@ -254,42 +266,31 @@ pub async fn discover_caldav_calendars(
     let calendar_home = client.discover_calendar_home(&principal).await?;
     let calendars = client.list_calendars(&calendar_home).await?;
     for cal_info in &calendars {
-        upsert_calendar(pool, source_id, cal_info).await?;
+        upsert_calendar(pool, source_id, cal_info, NewCalendar::Unsynced).await?;
     }
     Ok(calendars.len())
 }
 
-/// First contact with a CalDAV source just created with
-/// `sync_new_calendars = 0`: list its calendars, all unsynced, so its owner
-/// picks the ones to sync before any event is fetched. Then set the source
-/// back to syncing calendars that appear later, as every source does by
-/// default; the owner can change that on the calendar picker.
-///
-/// A failure is recorded on the source like a failed sync. A source whose
-/// listing failed or found nothing gets `sync_new_calendars = 1` back, so it
-/// behaves as before on its next sync. A source that listed calendars keeps
-/// `sync_new_calendars = 0` until its owner saves the picker: otherwise a
-/// background sync could enable and fetch a calendar that shows up before
-/// the owner has chosen.
-pub async fn discover_new_caldav_source(
-    pool: &SqlitePool,
-    key: &[u8; 32],
-    client: &CaldavClient,
-    source_id: &str,
-) -> Result<usize> {
-    let lock = source_lock(source_id).await;
-    let _guard = lock.lock().await;
-    let result = discover_caldav_calendars(pool, client, source_id).await;
-    if let Err(e) = &result {
-        crate::commands::sync_health::record_sync_failure(pool, key, source_id, e).await;
-    }
-    if !matches!(result, Ok(n) if n > 0) {
-        set_sync_new_calendars(pool, source_id, true).await?;
-    }
-    result
+/// Whether a calendar `source_id` lists for the first time starts synced.
+/// Only if its owner said so (`sync_new_calendars`, which only the calendar
+/// picker and `calrs source calendars --sync-new` turn on, so never before
+/// the owner has set the source up), or if the admin manages the source
+/// (Exchange through the service account), whose calendars always synced
+/// on their own. A source that is gone answers `false`.
+async fn new_calendars_sync(pool: &SqlitePool, source_id: &str) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT sync_new_calendars = 1 OR managed = 1 FROM caldav_sources WHERE id = ?",
+    )
+    .bind(source_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false)
 }
 
-/// Set what `source_id` does with calendars it lists for the first time.
+/// Set what `source_id` does with calendars it lists for the first time
+/// from now on (see [`new_calendars_sync`]).
 pub(crate) async fn set_sync_new_calendars(
     pool: &SqlitePool,
     source_id: &str,
@@ -332,7 +333,7 @@ async fn sync_caldav_calendars(
     for cal_info in &calendars {
         // Upsert calendar and get stored state
         let (cal_id, stored_ctag, stored_sync_token, sync_enabled) =
-            upsert_calendar(pool, source_id, cal_info).await?;
+            upsert_calendar(pool, source_id, cal_info, NewCalendar::SourceSetting).await?;
         let generation = calendar_generation(pool, &cal_id).await;
 
         let cal_label = cal_info.display_name.as_deref().unwrap_or(&cal_info.href);
@@ -1011,12 +1012,20 @@ async fn sync_ews_calendars(
             cal.display_name = Some(crate::ews::global::neutral_calendar_name(n));
         }
     }
-    let not_synced: Vec<String> =
-        sqlx::query_scalar("SELECT href FROM calendars WHERE source_id = ? AND sync_enabled = 0")
-            .bind(source_id)
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
+    // Only folders that are turned on are fetched. A folder listed for the
+    // first time is fetched only if it will be created synced below (see
+    // `upsert_calendar_provider`), so an unsynced one is not fetched, not
+    // even once.
+    let known: std::collections::HashMap<String, bool> = sqlx::query_as::<_, (String, bool)>(
+        "SELECT href, sync_enabled FROM calendars WHERE source_id = ?",
+    )
+    .bind(source_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .collect();
+    let new_synced = new_calendars_sync(pool, source_id).await;
     // A source that has no calendar yet is meeting its mailbox for the first
     // time (or again, after `forget_mailbox`): the moment to pick where
     // bookings go.
@@ -1035,26 +1044,16 @@ async fn sync_ews_calendars(
     let since_iso = since_dt.to_rfc3339();
     let since_prefix = since_dt.format("%Y%m%d").to_string();
 
-    // Folders the source has never listed start synced only if the source
-    // says so. Read it now, so a folder that will be created disabled is not
-    // fetched either.
-    let known: Vec<String> = sqlx::query_scalar("SELECT href FROM calendars WHERE source_id = ?")
-        .bind(source_id)
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
-    let sync_new = source_syncs_new_calendars(pool, source_id).await?;
-
     let mut fetched = Vec::with_capacity(calendars.len());
     for cal_info in &calendars {
-        let is_new = !known.contains(&cal_info.id);
-        if not_synced.contains(&cal_info.id) || (is_new && !sync_new) {
+        let fetch = known.get(&cal_info.id).copied().unwrap_or(new_synced);
+        if !fetch {
             fetched.push(None);
-            continue;
+        } else {
+            fetched.push(Some(
+                provider.fetch_events_since(&cal_info.id, &since_iso).await,
+            ));
         }
-        fetched.push(Some(
-            provider.fetch_events_since(&cal_info.id, &since_iso).await,
-        ));
     }
     let default_href = if first_discovery {
         default_write_calendar(pool, provider, source_id, &calendars).await
@@ -2156,10 +2155,9 @@ async fn upsert_calendar_provider(
         }
         None => {
             let id = Uuid::new_v4().to_string();
-            // Someone else's calendar does not make the user busy until they
-            // say so: a colleague's meetings are not the host's. Only the
-            // first discovery decides; the user's later choice stands.
-            let sync_enabled = source_syncs_new_calendars(pool, source_id).await?;
+            // Listed, not synced, unless the owner chose to sync calendars
+            // found later or the admin manages the source.
+            let sync_enabled = new_calendars_sync(pool, source_id).await;
             sqlx::query(
                 "INSERT INTO calendars (id, source_id, href, display_name, color, ctag, is_busy, read_only, sync_enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
@@ -2296,11 +2294,14 @@ async fn upsert_provider_events(
 // --- Helper functions ---
 
 /// Upsert a calendar record and return (cal_id, stored_ctag,
-/// stored_sync_token, sync_enabled)
+/// stored_sync_token, sync_enabled). A new calendar starts with
+/// `sync_new`, unsynced unless its owner chose to sync calendars
+/// found later.
 async fn upsert_calendar(
     pool: &SqlitePool,
     source_id: &str,
     cal_info: &crate::caldav::CalendarInfo,
+    sync_new: NewCalendar,
 ) -> Result<(String, Option<String>, Option<String>, bool)> {
     let existing: Option<(String, Option<String>, Option<String>, bool)> = sqlx::query_as(
         "SELECT id, ctag, sync_token, sync_enabled FROM calendars WHERE source_id = ? AND href = ?",
@@ -2323,7 +2324,10 @@ async fn upsert_calendar(
         }
         None => {
             let id = Uuid::new_v4().to_string();
-            let sync_enabled = source_syncs_new_calendars(pool, source_id).await?;
+            let sync_enabled = match sync_new {
+                NewCalendar::SourceSetting => new_calendars_sync(pool, source_id).await,
+                NewCalendar::Unsynced => false,
+            };
             // No ctag yet: none of its events has been fetched. The sync
             // stores it after the first fetch (`update_calendar_sync_state`).
             // Stored now, a calendar listed by discovery would look
@@ -2342,18 +2346,6 @@ async fn upsert_calendar(
             Ok((id, None, None, sync_enabled))
         }
     }
-}
-
-/// Whether a calendar `source_id` lists for the first time starts synced:
-/// the source's `sync_new_calendars` setting. A source that is gone (the
-/// row was deleted mid-sync) answers `true`, as before the setting existed.
-async fn source_syncs_new_calendars(pool: &SqlitePool, source_id: &str) -> Result<bool> {
-    let setting: Option<bool> =
-        sqlx::query_scalar("SELECT sync_new_calendars FROM caldav_sources WHERE id = ?")
-            .bind(source_id)
-            .fetch_optional(pool)
-            .await?;
-    Ok(setting.unwrap_or(true))
 }
 
 /// Upsert events from raw CalDAV data. Returns count of events processed.
@@ -6229,27 +6221,21 @@ END:VCALENDAR
         );
     }
 
-    /// A source added from the dashboard lists its calendars, all unsynced,
+    /// The first sync of a new source lists its calendars, all unsynced,
     /// without a single REPORT, then syncs only what its owner turns on.
     #[tokio::test]
     async fn a_new_source_lists_its_calendars_without_fetching_any() {
         let pool = setup_test_db().await;
         let (source_id, _) = seed_fixtures(&pool).await;
         let key = [0u8; 32];
-        set_sync_new_calendars(&pool, &source_id, false)
-            .await
-            .unwrap();
         let (base, requests) = spawn_two_calendar_dav().await;
         let client = CaldavClient::new(&base, "user", "pw");
 
-        let found = discover_new_caldav_source(&pool, &key, &client, &source_id)
-            .await
-            .unwrap();
-        assert_eq!(found, 2);
+        sync_source(&pool, &key, &client, &source_id).await.unwrap();
         let seen = requests.lock().unwrap().clone();
         assert!(
-            seen.iter().all(|r| r.starts_with("PROPFIND")),
-            "discovery fetched events: {seen:?}"
+            !seen.iter().any(|r| r.starts_with("REPORT")),
+            "the first sync fetched events: {seen:?}"
         );
         let off: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM calendars WHERE source_id = ? AND sync_enabled = 0",
@@ -6259,10 +6245,6 @@ END:VCALENDAR
         .await
         .unwrap();
         assert_eq!(off, 2, "both calendars are listed unsynced");
-        assert!(
-            !source_syncs_new_calendars(&pool, &source_id).await.unwrap(),
-            "calendars found later stay off until the picker is saved"
-        );
 
         let mine: String = sqlx::query_scalar(
             "SELECT id FROM calendars WHERE source_id = ? AND href = '/cals/mine/'",
@@ -6288,8 +6270,9 @@ END:VCALENDAR
         );
     }
 
-    /// A calendar listed by `--discover` has no event yet, so the next sync
-    /// fetches it even though its ctag has not changed since the listing.
+    /// A calendar listed by `--discover` and then turned on has no event
+    /// yet, so the next sync fetches it even though its ctag has not changed
+    /// since the listing.
     #[tokio::test]
     async fn a_calendar_listed_by_discovery_is_fetched_by_the_next_sync() {
         let pool = setup_test_db().await;
@@ -6304,6 +6287,16 @@ END:VCALENDAR
                 .unwrap(),
             2
         );
+        let mine: String = sqlx::query_scalar(
+            "SELECT id FROM calendars WHERE source_id = ? AND href = '/cals/mine/'",
+        )
+        .bind(&source_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        set_calendar_sync_enabled(&pool, &source_id, &mine, true)
+            .await
+            .unwrap();
         requests.lock().unwrap().clear();
         sync_source(&pool, &key, &client, &source_id).await.unwrap();
         let seen = requests.lock().unwrap().clone();
@@ -6317,10 +6310,10 @@ END:VCALENDAR
         );
     }
 
-    /// With `sync_new_calendars = 0`, a sync lists new calendars but never
-    /// fetches them; calendars already known keep their own setting.
+    /// A sync lists a calendar the source shows for the first time but
+    /// never fetches it; calendars already known keep their own setting.
     #[tokio::test]
-    async fn calendars_found_by_a_sync_follow_the_source_setting() {
+    async fn a_calendar_found_by_a_sync_is_listed_but_not_fetched() {
         let pool = setup_test_db().await;
         let (source_id, _) = seed_fixtures(&pool).await;
         let key = [0u8; 32];
@@ -6330,9 +6323,6 @@ END:VCALENDAR
         sqlx::query("INSERT INTO calendars (id, source_id, href, display_name) VALUES ('known', ?, '/cals/mine/', 'Mine')")
             .bind(&source_id)
             .execute(&pool)
-            .await
-            .unwrap();
-        set_sync_new_calendars(&pool, &source_id, false)
             .await
             .unwrap();
 
@@ -6353,30 +6343,74 @@ END:VCALENDAR
         assert!(!colleague_synced);
     }
 
-    /// A listing that fails is recorded on the source like a failed sync,
-    /// and leaves the source syncing new calendars, as before.
+    /// Once the owner chose to sync calendars found later, a sync creates
+    /// one synced and fetches it at once.
     #[tokio::test]
-    async fn a_failed_first_listing_restores_the_default() {
+    async fn calendars_found_later_follow_the_owners_choice() {
         let pool = setup_test_db().await;
         let (source_id, _) = seed_fixtures(&pool).await;
         let key = [0u8; 32];
-        set_sync_new_calendars(&pool, &source_id, false)
+        let (base, requests) = spawn_two_calendar_dav().await;
+        let client = CaldavClient::new(&base, "user", "pw");
+        sqlx::query("INSERT INTO calendars (id, source_id, href, display_name) VALUES ('known', ?, '/cals/mine/', 'Mine')")
+            .bind(&source_id)
+            .execute(&pool)
             .await
             .unwrap();
-        // Nothing listens on port 1.
-        let client = CaldavClient::new("http://127.0.0.1:1/dav/", "user", "pw");
-
-        assert!(discover_new_caldav_source(&pool, &key, &client, &source_id)
+        set_sync_new_calendars(&pool, &source_id, true)
             .await
-            .is_err());
-        assert!(source_syncs_new_calendars(&pool, &source_id).await.unwrap());
-        let error: Option<String> =
-            sqlx::query_scalar("SELECT last_sync_error FROM caldav_sources WHERE id = ?")
+            .unwrap();
+
+        sync_source(&pool, &key, &client, &source_id).await.unwrap();
+        let seen = requests.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|r| r.starts_with("REPORT /cals/colleague")),
+            "the new calendar was not fetched: {seen:?}"
+        );
+        let colleague_synced: bool = sqlx::query_scalar(
+            "SELECT sync_enabled FROM calendars WHERE source_id = ? AND href = '/cals/colleague/'",
+        )
+        .bind(&source_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(colleague_synced);
+    }
+
+    /// A listing for review (`--discover`, a source pointed at another
+    /// account) creates its new calendars unsynced even when the source
+    /// syncs calendars found later.
+    #[tokio::test]
+    async fn a_listing_for_review_never_turns_a_calendar_on() {
+        let pool = setup_test_db().await;
+        let (source_id, _) = seed_fixtures(&pool).await;
+        let (base, _) = spawn_two_calendar_dav().await;
+        let client = CaldavClient::new(&base, "user", "pw");
+        set_sync_new_calendars(&pool, &source_id, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            discover_caldav_calendars(&pool, &client, &source_id)
+                .await
+                .unwrap(),
+            2
+        );
+        let on: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM calendars WHERE source_id = ? AND sync_enabled = 1",
+        )
+        .bind(&source_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(on, 0);
+        let sync_new: bool =
+            sqlx::query_scalar("SELECT sync_new_calendars FROM caldav_sources WHERE id = ?")
                 .bind(&source_id)
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert!(error.is_some(), "the failure is shown on the source");
+        assert!(sync_new, "the listing leaves the owner's choice alone");
     }
 
     #[tokio::test]
@@ -6696,7 +6730,9 @@ END:VCALENDAR
         let pool = setup_test_db().await;
         let (source_id, _) = seed_fixtures(&pool).await;
         let key = [0u8; 32];
-        sqlx::query("INSERT INTO calendars (id, source_id, href, display_name, sync_enabled) VALUES (?, ?, 'colleague', 'colleague', 0)")
+        sqlx::query("INSERT INTO calendars (id, source_id, href, display_name, sync_enabled) VALUES (?, ?, 'colleague', 'colleague', 0), (?, ?, 'mine', 'mine', 1)")
+            .bind(Uuid::new_v4().to_string())
+            .bind(&source_id)
             .bind(Uuid::new_v4().to_string())
             .bind(&source_id)
             .execute(&pool)
@@ -6711,10 +6747,95 @@ END:VCALENDAR
         assert_eq!(*provider.0.lock().unwrap(), vec!["mine".to_string()]);
     }
 
-    /// With `sync_new_calendars = 0`, a folder the mailbox lists for the
-    /// first time is created disabled and never fetched, not even once.
+    /// The first sync of a Graph (or EWS-through-the-trait) source lists its
+    /// calendars, all unsynced, and fetches none of them.
     #[tokio::test]
-    async fn ews_sync_never_fetches_a_new_folder_when_new_calendars_are_off() {
+    async fn provider_sync_never_fetches_a_new_calendar() {
+        let pool = setup_test_db().await;
+        let (source_id, _) = seed_fixtures(&pool).await;
+        let key = [0u8; 32];
+        let provider = TwoFolderProvider(Default::default());
+
+        sync_provider_source(&pool, &key, &provider, &source_id)
+            .await
+            .unwrap();
+
+        assert!(provider.0.lock().unwrap().is_empty());
+        let synced: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM calendars WHERE source_id = ? AND sync_enabled = 1",
+        )
+        .bind(&source_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let listed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM calendars WHERE source_id = ?")
+            .bind(&source_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((listed, synced), (2, 0));
+    }
+
+    /// A source the admin manages keeps its old rule: the folders its
+    /// mailbox lists for the first time are synced and fetched at once.
+    #[tokio::test]
+    async fn a_managed_ews_source_still_syncs_new_folders() {
+        let pool = setup_test_db().await;
+        let (source_id, _) = seed_fixtures(&pool).await;
+        let key = [0u8; 32];
+        sqlx::query("UPDATE caldav_sources SET managed = 1 WHERE id = ?")
+            .bind(&source_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let provider = TwoFolderProvider(Default::default());
+
+        sync_ews_source(&pool, &key, &provider, &source_id)
+            .await
+            .unwrap();
+
+        let mut fetched = provider.0.lock().unwrap().clone();
+        fetched.sort();
+        assert_eq!(fetched, ["colleague", "mine"]);
+        let synced: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM calendars WHERE source_id = ? AND sync_enabled = 1",
+        )
+        .bind(&source_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(synced, 2);
+    }
+
+    /// With calendars found later turned on, a folder the mailbox lists for
+    /// the first time is created synced and fetched.
+    #[tokio::test]
+    async fn ews_sync_fetches_a_new_folder_when_the_owner_chose_so() {
+        let pool = setup_test_db().await;
+        let (source_id, _) = seed_fixtures(&pool).await;
+        let key = [0u8; 32];
+        sqlx::query("INSERT INTO calendars (id, source_id, href, display_name, sync_enabled) VALUES (?, ?, 'mine', 'mine', 0)")
+            .bind(Uuid::new_v4().to_string())
+            .bind(&source_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        set_sync_new_calendars(&pool, &source_id, true)
+            .await
+            .unwrap();
+        let provider = TwoFolderProvider(Default::default());
+
+        sync_ews_source(&pool, &key, &provider, &source_id)
+            .await
+            .unwrap();
+
+        assert_eq!(*provider.0.lock().unwrap(), vec!["colleague".to_string()]);
+    }
+
+    /// A folder the mailbox lists for the first time is created unsynced and
+    /// not fetched, not even once.
+    #[tokio::test]
+    async fn ews_sync_never_fetches_a_new_folder() {
         let pool = setup_test_db().await;
         let (source_id, _) = seed_fixtures(&pool).await;
         let key = [0u8; 32];
@@ -6722,9 +6843,6 @@ END:VCALENDAR
             .bind(Uuid::new_v4().to_string())
             .bind(&source_id)
             .execute(&pool)
-            .await
-            .unwrap();
-        set_sync_new_calendars(&pool, &source_id, false)
             .await
             .unwrap();
         let provider = TwoFolderProvider(Default::default());

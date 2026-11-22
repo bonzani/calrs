@@ -1,7 +1,9 @@
-{#- The calendars of a source with a checkbox each, and the setting for
-    calendars it lists later. Posts to the picker's handler. Used by the
-    picker page and by the source edit page (with return_to = "edit").
-    Expects: source_id, calendars, sync_new; optional: setup, return_to. -#}
+{#- The calendars of a source with a checkbox each. Posts to the picker's
+    handler, with the setting for calendars the source lists later (off
+    until the owner checks it; not shown for a managed source, which syncs
+    them anyway). Used by the picker page and by the source edit page (with
+    return_to = "edit"). Expects: source_id, calendars, sync_new; optional:
+    setup, return_to, managed. -#}
 <style>
   .source-cal-list { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1.25rem; }
   .source-cal-item { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; padding: 0.75rem 1rem; border: 1px solid var(--border); border-radius: var(--radius); cursor: pointer; }
@@ -36,10 +38,12 @@
     {% else %}
     <p class="empty" style="padding: 1rem;">{{ t("source-calendars-empty") }}</p>
     {% endif %}
+    {% if not managed %}
     <label class="source-cal-new">
       <input type="checkbox" name="sync_new" value="on" {% if sync_new %}checked{% endif %}>
       <span>{{ t("source-calendars-sync-new") }}</span>
     </label>
+    {% endif %}
     <button type="submit" class="slot-btn" style="background: var(--accent); color: #fff; border: none; padding: 0.5rem 1.5rem; border-radius: var(--radius); font-size: 0.95rem; cursor: pointer;">
       {%- if setup %}{{ t("source-calendars-setup-save") }}{% else %}{{ t("source-calendars-save") }}{% endif -%}
     </button>

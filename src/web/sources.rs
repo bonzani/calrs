@@ -437,9 +437,8 @@ pub(super) async fn create_source(
         }
     };
 
-    let is_caldav = provider_type == crate::providers::factory::kinds::CALDAV;
     let _ = sqlx::query(
-        "INSERT INTO caldav_sources (id, account_id, name, url, username, password_enc, provider_type, sync_new_calendars) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO caldav_sources (id, account_id, name, url, username, password_enc, provider_type) VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&account_id)
@@ -448,20 +447,15 @@ pub(super) async fn create_source(
     .bind(&username)
     .bind(&password_enc)
     .bind(&provider_type)
-    .bind(!is_caldav)
     .execute(&state.pool)
     .await;
 
     tracing::info!(source_name = %name, provider = %provider_type, user = %auth_user.user.email, "calendar source added");
 
-    if is_caldav {
-        let client = crate::caldav::CaldavClient::new(&url, &username, &form.password);
-        return pick_calendars_of_new_source(&state, &client, &id).await;
-    }
-
-    // Exchange: sync at once, then redirect to write-back setup if
-    // calendars were found.
-    let (messages, calendar_count) = run_sync(
+    // The first sync lists the calendars: every one starts unsynced, so no
+    // event is fetched. The owner then picks them on the edit page, whose
+    // save runs the sync that fetches the chosen ones.
+    let (_, calendar_count) = run_sync(
         &state.pool,
         &state.secret_key,
         &id,
@@ -472,46 +466,20 @@ pub(super) async fn create_source(
     )
     .await;
 
-    if calendar_count > 0 {
-        let joined_messages = messages.join("\n");
-        let encoded_messages = urlencoding::encode(&joined_messages);
-        return Redirect::to(&format!(
-            "/dashboard/sources/{}/setup-write?sync_messages={}",
-            id, encoded_messages
-        ))
-        .into_response();
-    }
-
-    Redirect::to("/dashboard/sources").into_response()
+    Redirect::to(&setup_destination(&id, calendar_count, true)).into_response()
 }
 
-/// After a CalDAV source is created: list its calendars without syncing
-/// any, and send its owner to the calendar picker in setup mode, whose save
-/// runs the first sync. When nothing could be listed, the source is synced
-/// as before (`discover_new_caldav_source` restored its default), and the
-/// owner lands on the sources page, where a failure shows.
-async fn pick_calendars_of_new_source(
-    state: &AppState,
-    client: &crate::caldav::CaldavClient,
-    source_id: &str,
-) -> Response {
-    match crate::commands::sync::discover_new_caldav_source(
-        &state.pool,
-        &state.secret_key,
-        client,
-        source_id,
-    )
-    .await
-    {
-        Ok(count) if count > 0 => {
-            Redirect::to(&format!("/dashboard/sources/{source_id}/calendars?setup=1"))
-                .into_response()
-        }
-        Ok(_) => Redirect::to("/dashboard/sources").into_response(),
-        Err(e) => {
-            tracing::warn!(source_id = %source_id, error = %format!("{e:#}"), "could not list the calendars of a new source");
-            Redirect::to("/dashboard/sources").into_response()
-        }
+/// Where a newly connected source sends its owner: the calendar selection
+/// in setup mode when calendars were listed (the edit page for a source it
+/// can edit, the calendars page for one connected through OAuth), the
+/// sources page otherwise, where a failed listing shows.
+fn setup_destination(source_id: &str, calendar_count: usize, editable: bool) -> String {
+    if calendar_count == 0 {
+        "/dashboard/sources".to_string()
+    } else if editable {
+        format!("/dashboard/sources/{source_id}/edit?setup=1#calendars")
+    } else {
+        format!("/dashboard/sources/{source_id}/calendars?setup=1")
     }
 }
 
@@ -570,6 +538,17 @@ async fn render_source_form_error(
     )
 }
 
+/// What the calendars card of the edit page says above its list.
+#[derive(Clone, Copy, PartialEq)]
+enum CalendarsCard {
+    Plain,
+    /// Back from saving the card.
+    Saved,
+    /// The source was just added: nothing is synced yet, and saving runs
+    /// the first sync.
+    Setup,
+}
+
 /// Render the source form in editing mode with the given values.
 #[allow(clippy::too_many_arguments)]
 async fn render_source_edit_form(
@@ -580,15 +559,15 @@ async fn render_source_edit_form(
     url: &str,
     username: &str,
     error: &str,
-    calendars_saved: bool,
+    card: CalendarsCard,
 ) -> Html<String> {
     // The card below the connection: the calendars the source lists, as
     // cached by its last sync or listing.
     let write_href = owned_source(&state.pool, source_id, &auth_user.user.id)
         .await
         .and_then(|(_, write)| write);
-    let (calendars, sync_new) =
-        source_calendar_values(&state.pool, source_id, write_href.as_deref()).await;
+    let calendars = source_calendar_values(&state.pool, source_id, write_href.as_deref()).await;
+    let sync_new = source_syncs_new_calendars(&state.pool, source_id).await;
 
     let tmpl = match state.templates.get_template("source_form.html") {
         Ok(t) => t,
@@ -613,7 +592,8 @@ async fn render_source_edit_form(
             error => error,
             calendars => calendars,
             sync_new => sync_new,
-            calendars_saved => calendars_saved,
+            calendars_saved => card == CalendarsCard::Saved,
+            setup => card == CalendarsCard::Setup,
             return_to => "edit",
             sidebar => sidebar_context(auth_user, "sources"),
             lang => auth_user.lang,
@@ -628,6 +608,30 @@ async fn render_source_edit_form(
 pub(super) struct SourceEditQuery {
     /// Back from saving the calendars card.
     saved: Option<String>,
+    /// The source was just added: the calendars card runs the first sync.
+    setup: Option<String>,
+}
+
+impl SourceEditQuery {
+    fn card(&self) -> CalendarsCard {
+        if self.setup.is_some() {
+            CalendarsCard::Setup
+        } else if self.saved.is_some() {
+            CalendarsCard::Saved
+        } else {
+            CalendarsCard::Plain
+        }
+    }
+
+    /// The same visit, on the calendars page.
+    fn calendars_page(&self, source_id: &str) -> String {
+        let query = match self.card() {
+            CalendarsCard::Setup => "?setup=1",
+            CalendarsCard::Saved => "?saved=1",
+            CalendarsCard::Plain => "",
+        };
+        format!("/dashboard/sources/{source_id}/calendars{query}")
+    }
 }
 
 pub(super) async fn edit_source_form(
@@ -638,9 +642,10 @@ pub(super) async fn edit_source_form(
 ) -> impl IntoResponse {
     let user = &auth_user.user;
     // A managed source takes its endpoint and credentials from the admin's
-    // global Exchange config: there is nothing to edit on the row itself.
+    // global Exchange config: there is nothing to edit on the row itself,
+    // but its owner still picks its calendars.
     if ews_admin::is_managed_source(&state.pool, &user.id, &source_id).await {
-        return ews_admin::forbidden(auth_user.lang, "sources-managed-no-edit");
+        return Redirect::to(&query.calendars_page(&source_id)).into_response();
     }
     // Verify ownership and load current values.
     let source: Option<(String, String, String, Option<String>)> = sqlx::query_as(
@@ -661,9 +666,10 @@ pub(super) async fn edit_source_form(
     };
 
     // OAuth2 sources can't be edited via the basic-auth form; the only
-    // useful "edit" is re-running the consent flow.
+    // useful "edit" is re-running the consent flow. Their calendars are
+    // picked on the calendars page.
     if auth_type.as_deref() == Some("oauth2") {
-        return Redirect::to("/dashboard/sources").into_response();
+        return Redirect::to(&query.calendars_page(&source_id)).into_response();
     }
 
     render_source_edit_form(
@@ -674,7 +680,7 @@ pub(super) async fn edit_source_form(
         &url,
         &username,
         "",
-        query.saved.is_some(),
+        query.card(),
     )
     .await
     .into_response()
@@ -735,7 +741,7 @@ pub(super) async fn update_source(
             &form.url,
             &form.username,
             "Name, URL, and username are required.",
-            false,
+            CalendarsCard::Plain,
         )
         .await
         .into_response();
@@ -750,7 +756,7 @@ pub(super) async fn update_source(
             &url,
             &username,
             &e.to_string(),
-            false,
+            CalendarsCard::Plain,
         )
         .await
         .into_response();
@@ -783,7 +789,14 @@ pub(super) async fn update_source(
         if let Err(e) = client.check_connection().await {
             let msg = format!("Connection failed: {}. Check the URL and credentials, or check \"Skip connection test\" to save anyway.", e);
             return render_source_edit_form(
-                &state, &auth_user, &source_id, &name, &url, &username, &msg, false,
+                &state,
+                &auth_user,
+                &source_id,
+                &name,
+                &url,
+                &username,
+                &msg,
+                CalendarsCard::Plain,
             )
             .await
             .into_response();
@@ -848,8 +861,10 @@ pub(super) async fn update_source(
 
     // Pointed at another server or account: list what the new one holds,
     // without fetching events, and show it in the calendars card of this
-    // page, so the owner picks before the next sync. Not with "Skip
-    // connection test": the owner asked not to contact the server now.
+    // page. Every calendar it lists for the first time starts unsynced, so
+    // nothing of the new account is fetched before the owner has chosen.
+    // Not with "Skip connection test": the owner asked not to contact the
+    // server now.
     let moved =
         previous_url.trim() != url || !previous_username.trim().eq_ignore_ascii_case(&username);
     if provider_type == crate::providers::factory::kinds::CALDAV && moved && !skip_test {
@@ -1893,8 +1908,9 @@ pub(super) async fn google_callback(
             // listed unsynced until its owner picks them (see create_source).
             let source_id = uuid::Uuid::new_v4().to_string();
             let _ = sqlx::query(
-                "INSERT INTO caldav_sources (id, account_id, name, url, username, auth_type, oauth2_provider, access_token_enc, refresh_token_enc, token_expires_at, sync_new_calendars)
-                 VALUES (?, ?, 'Google Calendar', ?, ?, 'oauth2', 'google', ?, ?, ?, 0)",            )
+                "INSERT INTO caldav_sources (id, account_id, name, url, username, auth_type, oauth2_provider, access_token_enc, refresh_token_enc, token_expires_at)
+                 VALUES (?, ?, 'Google Calendar', ?, ?, 'oauth2', 'google', ?, ?, ?)",
+            )
             .bind(&source_id)
             .bind(&account_id)
             .bind(&caldav_url)
@@ -1927,35 +1943,10 @@ pub(super) async fn google_callback(
             .unwrap(),
     );
 
-    // A new source: list its calendars and let its owner pick the ones to
-    // sync. A reconnect keeps its selection and syncs at once.
-    if is_new {
-        let client = match crate::oauth2_caldav::build_client_for_source(
-            &state.pool,
-            &state.secret_key,
-            &source_id,
-            &caldav_url,
-            "oauth2",
-            &google_email,
-            None,
-            Some(&access_token_enc),
-            Some(&expires_at.to_rfc3339()),
-        )
-        .await
-        {
-            Ok(client) => client,
-            Err(e) => {
-                tracing::warn!(source_id = %source_id, error = %format!("{e:#}"), "could not use a newly connected Google calendar");
-                let _ =
-                    crate::commands::sync::set_sync_new_calendars(&state.pool, &source_id, true)
-                        .await;
-                return (headers, Redirect::to("/dashboard/sources")).into_response();
-            }
-        };
-        let redirect = pick_calendars_of_new_source(&state, &client, &source_id).await;
-        return (headers, redirect).into_response();
-    }
-    // Auto-sync
+    // The sync lists the calendars and fetches only the ones the owner
+    // turned on: none for a new source, whose owner then picks them. A
+    // reconnect keeps its selection; a calendar Google lists for the first
+    // time starts unsynced there too.
     let (_, calendar_count) = run_sync_for_source(
         &state.pool,
         &state.secret_key,
@@ -1970,7 +1961,9 @@ pub(super) async fn google_callback(
     )
     .await;
 
-    let redirect = if calendar_count > 0 {
+    let redirect = if is_new {
+        Redirect::to(&setup_destination(&source_id, calendar_count, false))
+    } else if calendar_count > 0 {
         Redirect::to(&format!("/dashboard/sources/{}/setup-write", source_id))
     } else {
         Redirect::to("/dashboard/sources")
@@ -1999,13 +1992,12 @@ async fn owned_source(
 }
 
 /// The calendars of `source_id` as the picker shows them (the picker page
-/// and the card on the edit page), and whether calendars it lists later
-/// start synced.
+/// and the card on the edit page).
 async fn source_calendar_values(
     pool: &SqlitePool,
     source_id: &str,
     write_href: Option<&str>,
-) -> (Vec<minijinja::Value>, bool) {
+) -> Vec<minijinja::Value> {
     #[allow(clippy::type_complexity)]
     let calendars: Vec<(String, String, Option<String>, Option<String>, bool, i64)> =
         sqlx::query_as(
@@ -2019,14 +2011,7 @@ async fn source_calendar_values(
         .await
         .unwrap_or_default();
 
-    let sync_new: bool =
-        sqlx::query_scalar("SELECT sync_new_calendars FROM caldav_sources WHERE id = ?")
-            .bind(source_id)
-            .fetch_one(pool)
-            .await
-            .unwrap_or(true);
-
-    let values: Vec<minijinja::Value> = calendars
+    calendars
         .iter()
         .map(|(id, href, name, color, sync_enabled, event_count)| {
             context! {
@@ -2039,8 +2024,17 @@ async fn source_calendar_values(
                 is_write => write_href == Some(href.as_str()),
             }
         })
-        .collect();
-    (values, sync_new)
+        .collect()
+}
+
+/// Whether `source_id` syncs the calendars it finds later (the picker's
+/// checkbox). Off until its owner turns it on.
+async fn source_syncs_new_calendars(pool: &SqlitePool, source_id: &str) -> bool {
+    sqlx::query_scalar("SELECT sync_new_calendars FROM caldav_sources WHERE id = ?")
+        .bind(source_id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false)
 }
 
 #[derive(Deserialize)]
@@ -2063,11 +2057,10 @@ pub(super) async fn source_calendars_form(
         return Redirect::to("/dashboard/sources").into_response();
     };
 
-    let (cal_values, stored_sync_new) =
-        source_calendar_values(&state.pool, &source_id, write_href.as_deref()).await;
-    // A new source holds 0 until its picker is saved, so nothing it lists
-    // meanwhile gets synced. The box still offers the default, checked.
-    let sync_new = query.setup.is_some() || stored_sync_new;
+    let cal_values = source_calendar_values(&state.pool, &source_id, write_href.as_deref()).await;
+    // A managed source syncs the calendars it finds later on its own.
+    let managed = crate::ews::global::is_managed(&state.pool, &source_id).await;
+    let sync_new = source_syncs_new_calendars(&state.pool, &source_id).await;
 
     let tmpl = match state.templates.get_template("source_calendars.html") {
         Ok(t) => t,
@@ -2081,9 +2074,10 @@ pub(super) async fn source_calendars_form(
             source_id => source_id,
             source_name => source_name,
             calendars => cal_values,
+            managed => managed,
+            sync_new => sync_new,
             saved => query.saved.is_some(),
             setup => query.setup.is_some(),
-            sync_new => sync_new,
             impersonating => impersonating,
             impersonating_name => impersonating_name,
         })

@@ -76,26 +76,25 @@ Sync pulls all VEVENT data from your calendars and stores it in the local SQLite
 
 Some servers (Kerio Connect, for instance) list every calendar the account subscribed to, colleagues' calendars included. Click **Calendars** on a source to pick the ones calrs syncs. An unchecked calendar is still listed, but its events are never fetched, its cached events are dropped at once, and it never blocks availability. A calendar does not need to be synced to receive bookings through write-back.
 
-When you add a CalDAV source from the dashboard (with a password or through Google), calrs lists its calendars without fetching anything and opens this page first. None of them is checked. Pick the ones to sync and click **Save and sync**: the first sync then reads only those. If you leave the page without saving, nothing of that source is synced, and the sources page says so.
+No calendar is synced before you turn it on, whatever the source: CalDAV, Google, Exchange or Microsoft 365. When you add a source from the dashboard, calrs lists its calendars without fetching any event and opens the selection first, on the edit page for a source added with a password and on its **Calendars** page for one connected through Google or Microsoft. None of them is checked. Pick the ones to sync and click **Save and sync**: the first sync then reads only those. If you leave without saving, nothing of that source is synced, and the sources page says so.
 
-**Also sync calendars that appear on this source later** decides what happens to a calendar the server lists for the first time after that, such as one a colleague just shared with you. Checked (the default), it is synced until you uncheck it. Unchecked, it shows up on this page unchecked, and nothing is fetched from it until you check it. Exchange and Microsoft 365 sources keep syncing at once when added; the setting for calendars found later applies to them too.
+A calendar the server lists for the first time later, such as one a colleague just shared with you, also shows up unchecked, and nothing is fetched from it until you check it. If you would rather have those synced at once, check **Also sync calendars that appear on this source later** on the selection. It is off for every new source and only applies once you have saved the selection. Exchange sources your admin manages for you sync their calendars on their own, as before, and have no such setting.
 
 ```bash
-# Add a CalDAV source and list its calendars without syncing any.
-# Calendars that appear later stay unsynced until you run --sync-new true.
-calrs source add --url https://dav.example.com/ --username me --name Work --pick-calendars
+# Add a source. Nothing is synced until you enable calendars.
+calrs source add --url https://dav.example.com/ --username me --name Work
 
 # List a source's calendars
 calrs source calendars <id-prefix>
 
-# Read the calendar list from the server again, without fetching events
+# Read the calendar list from the server, without fetching events (CalDAV)
 calrs source calendars <id-prefix> --discover
 
 # Stop syncing one, sync another (calendar ID prefix, href or display name)
 calrs source calendars <id-prefix> --disable "Colleague" --enable "Personal"
 
-# Leave calendars found later unsynced until you enable them
-calrs source calendars <id-prefix> --sync-new false
+# Sync calendars that appear later at once (false turns it off again)
+calrs source calendars <id-prefix> --sync-new true
 ```
 
 The **Conflict calendars** section of an event type then picks, among the synced calendars, the ones that count for that event type. If none of the calendars it picked is synced any more, it falls back to every synced busy calendar, as when it picks none, so turning calendars off never leaves an event type with no conflicts at all.

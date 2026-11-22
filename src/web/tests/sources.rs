@@ -124,7 +124,7 @@ async fn the_edit_page_shows_the_calendars_card() {
             &format!("/dashboard/sources/{sid}/calendars"),
             &session,
             csrf,
-            &format!("_csrf={csrf}&sync={mine}&sync_new=on&return_to=edit"),
+            &format!("_csrf={csrf}&sync={mine}&return_to=edit"),
         ))
         .await
         .unwrap();
@@ -835,20 +835,13 @@ async fn sources_dashboard_links_the_calendar_selection() {
 }
 
 /// The first visit after a source was added: nothing is synced yet, the
-/// page says so, offers "Save and sync", and suggests syncing calendars
-/// found later.
+/// page says so and offers "Save and sync".
 #[tokio::test]
 async fn the_setup_visit_of_the_calendar_picker() {
     let (app, pool, session, _) = setup_test_app().await;
     let sid = seed_source(&pool, "Kerio", "pw").await;
     let (mine, colleague) = seed_two_calendars(&pool, &sid).await;
     sqlx::query("UPDATE calendars SET sync_enabled = 0 WHERE source_id = ?")
-        .bind(&sid)
-        .execute(&pool)
-        .await
-        .unwrap();
-    // As discovery leaves a source that listed calendars: off until saved.
-    sqlx::query("UPDATE caldav_sources SET sync_new_calendars = 0 WHERE id = ?")
         .bind(&sid)
         .execute(&pool)
         .await
@@ -866,18 +859,86 @@ async fn the_setup_visit_of_the_calendar_picker() {
     assert!(body.contains("nothing is fetched until you save"));
     assert!(body.contains("Save and sync"));
     assert!(body.contains(r#"<input type="hidden" name="setup" value="1">"#));
-    assert!(body.contains(r#"name="sync_new" value="on" checked"#));
     assert!(body.contains(&format!("value=\"{mine}\" >")));
     assert!(body.contains(&format!("value=\"{colleague}\" >")));
 }
 
-/// Unchecking "Also sync calendars that appear later" is stored on the
-/// source, and the page shows it unchecked afterwards.
+/// The same visit on the edit page, where a source added with a password
+/// lands: setup help, "Save and sync", and back to the edit page.
+#[tokio::test]
+async fn the_setup_visit_of_the_edit_page() {
+    let (app, pool, session, _) = setup_test_app().await;
+    let sid = seed_source(&pool, "Kerio", "pw").await;
+    seed_two_calendars(&pool, &sid).await;
+    sqlx::query("UPDATE calendars SET sync_enabled = 0 WHERE source_id = ?")
+        .bind(&sid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let body = body_string(
+        app.oneshot(get_authed(
+            &format!("/dashboard/sources/{sid}/edit?setup=1"),
+            &session,
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(body.contains("nothing is fetched until you save"));
+    assert!(contains_element_text(&body, "Save and sync"));
+    assert!(body.contains(r#"<input type="hidden" name="setup" value="1">"#));
+    assert!(body.contains(r#"<input type="hidden" name="return_to" value="edit">"#));
+}
+
+/// A source without a connection form (OAuth here) has its calendars
+/// picked on the calendars page: its edit link goes there, setup included.
+#[tokio::test]
+async fn the_edit_page_of_an_oauth_source_is_its_calendars_page() {
+    let (app, pool, session, _) = setup_test_app().await;
+    let sid = seed_source(&pool, "Google Calendar", "pw").await;
+    sqlx::query("UPDATE caldav_sources SET auth_type = 'oauth2' WHERE id = ?")
+        .bind(&sid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(get_authed(
+            &format!("/dashboard/sources/{sid}/edit?setup=1"),
+            &session,
+        ))
+        .await
+        .unwrap();
+    assert!(response.status().is_redirection());
+    assert_eq!(
+        response.headers()["location"],
+        format!("/dashboard/sources/{sid}/calendars?setup=1")
+    );
+}
+
+/// The setting for calendars found later is off until the owner checks
+/// it; saving the picker stores it, and the page shows it checked.
 #[tokio::test]
 async fn saving_the_picker_stores_the_setting_for_new_calendars() {
     let (app, pool, session, _) = setup_test_app().await;
     let sid = seed_source(&pool, "Kerio", "pw").await;
     let (mine, _) = seed_two_calendars(&pool, &sid).await;
+
+    let body = body_string(
+        app.clone()
+            .oneshot(get_authed(
+                &format!("/dashboard/sources/{sid}/calendars?setup=1"),
+                &session,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        body.contains(r#"name="sync_new" value="on" >"#),
+        "off until the owner checks it"
+    );
 
     let csrf = "test-csrf-sync-new";
     let response = app
@@ -886,7 +947,7 @@ async fn saving_the_picker_stores_the_setting_for_new_calendars() {
             &format!("/dashboard/sources/{sid}/calendars"),
             &session,
             csrf,
-            &format!("_csrf={csrf}&sync={mine}"),
+            &format!("_csrf={csrf}&sync={mine}&sync_new=on"),
         ))
         .await
         .unwrap();
@@ -897,7 +958,7 @@ async fn saving_the_picker_stores_the_setting_for_new_calendars() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert!(!sync_new);
+    assert!(sync_new);
 
     let body = body_string(
         app.oneshot(get_authed(
@@ -908,14 +969,13 @@ async fn saving_the_picker_stores_the_setting_for_new_calendars() {
         .unwrap(),
     )
     .await;
-    assert!(body.contains(r#"name="sync_new" value="on" >"#));
+    assert!(body.contains(r#"name="sync_new" value="on" checked"#));
     assert!(contains_element_text(&body, "Save"));
 }
 
-/// A source with no calendar yet still offers the setting for calendars
-/// that appear later, so it can be turned off before they do.
+/// A source with no calendar yet still renders the form, with its message.
 #[tokio::test]
-async fn the_picker_of_a_source_without_calendars_offers_the_setting() {
+async fn the_picker_of_a_source_without_calendars() {
     let (app, pool, session, _) = setup_test_app().await;
     let sid = seed_source(&pool, "Kerio", "pw").await;
 
@@ -929,8 +989,31 @@ async fn the_picker_of_a_source_without_calendars_offers_the_setting() {
     )
     .await;
     assert!(body.contains("No calendars found for this source yet"));
-    assert!(body.contains(r#"name="sync_new" value="on" checked"#));
     assert!(contains_element_text(&body, "Save"));
+}
+
+/// A managed source syncs the calendars it finds later anyway: no setting.
+#[tokio::test]
+async fn the_picker_of_a_managed_source_has_no_setting_for_new_calendars() {
+    let (app, pool, session, _) = setup_test_app().await;
+    let sid = seed_source(&pool, "Exchange", "pw").await;
+    seed_two_calendars(&pool, &sid).await;
+    sqlx::query("UPDATE caldav_sources SET managed = 1 WHERE id = ?")
+        .bind(&sid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let body = body_string(
+        app.oneshot(get_authed(
+            &format!("/dashboard/sources/{sid}/calendars"),
+            &session,
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(!body.contains(r#"name="sync_new""#));
 }
 
 /// A source whose calendars are all off (a picker left without saving)
